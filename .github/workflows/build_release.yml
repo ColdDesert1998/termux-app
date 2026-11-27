@@ -160,6 +160,7 @@ jobs:
           PY
 
       # 7. Build signed APK
+      
       - name: Build signed Release APK
         shell: bash
         env:
@@ -174,10 +175,28 @@ jobs:
 
           export TERMUX_PACKAGE_VARIANT="$PACKAGE_VARIANT"
 
+          echo "Preparing Bootstrap for: $TERMUX_PACKAGE_VARIANT"
+
+          # Download and verify Bootstrap ZIP files before NDK compilation.
           ./gradlew \
             --no-daemon \
             --stacktrace \
-            assembleRelease
+            :app:downloadBootstraps
+
+          # Verify that the required Bootstrap files exist.
+          test -s app/src/main/cpp/bootstrap-aarch64.zip
+          test -s app/src/main/cpp/bootstrap-arm.zip
+          test -s app/src/main/cpp/bootstrap-i686.zip
+          test -s app/src/main/cpp/bootstrap-x86_64.zip
+
+          echo "Bootstrap files are ready."
+
+          # Build signed release APK.
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            assemble
+            Release
 
       # 8. Verify APK signature and generate checksum
       - name: Verify APK and generate checksum
