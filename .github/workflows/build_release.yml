@@ -1,0 +1,260 @@
+
+name: Build and Publish Termux Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag, e.g. v0.118.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: termux-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.package_variant }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        package_variant:
+          - apt-android-7
+          - apt-android-5
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Prepare release information
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag_name }}
+          PACKAGE_VARIANT: ${{ matrix.package_variant }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+          else
+            TAG_NAME="$INPUT_TAG"
+          fi
+
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release tag: $TAG_NAME"
+            exit 1
+          fi
+
+          VERSION="${TAG_NAME#v}"
+
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "PACKAGE_VARIANT=$PACKAGE_VARIANT" >> "$GITHUB_ENV"
+
+          echo "TERMUX_APP_VERSION_NAME=$VERSION" >> "$GITHUB_ENV"
+
+          echo "TERMUX_APK_VERSION_TAG=${TAG_NAME}+${PACKAGE_VARIANT}-signed" >> "$GITHUB_ENV"
+
+      - name: Setup release signing
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$KEYSTORE_BASE64" ||
+                -z "$KEYSTORE_PASSWORD" ||
+                -z "$KEY_ALIAS" ||
+                -z "$KEY_PASSWORD" ]]; then
+            echo "::error::Missing release signing secrets"
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/termux-signing"
+
+          echo "$KEYSTORE_BASE64" | base64 --decode \
+            > "$RUNNER_TEMP/termux-signing/release.jks"
+
+          chmod 600 "$RUNNER_TEMP/termux-signing/release.jks"
+
+          keytool -list \
+            -keystore "$RUNNER_TEMP/termux-signing/release.jks" \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -alias "$KEY_ALIAS" >/dev/null
+
+          echo "TERMUX_KEYSTORE_FILE=$RUNNER_TEMP/termux-signing/release.jks" >> "$GITHUB_ENV"
+
+      - name: Create signing Gradle init script
+        shell: bash
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          cat > "$RUNNER_TEMP/release-signing.gradle" <<'GRADLE'
+          gradle.projectsEvaluated {
+              def app = gradle.rootProject.findProject(":app")
+
+              if (app == null) {
+                  throw new GradleException("Cannot find :app project")
+              }
+
+              def android = app.extensions.findByName("android")
+
+              if (android == null) {
+                  throw new GradleException("Android extension not found")
+              }
+
+              def signing = android.signingConfigs.create("ciRelease")
+
+              signing.storeFile = new File(System.getenv("TERMUX_KEYSTORE_FILE"))
+              signing.storePassword = System.getenv("KEYSTORE_PASSWORD")
+              signing.keyAlias = System.getenv("KEY_ALIAS")
+              signing.keyPassword = System.getenv("KEY_PASSWORD")
+
+              android.buildTypes.getByName("release").signingConfig = signing
+          }
+          GRADLE
+
+      - name: Build signed Release APK
+        shell: bash
+        env:
+          PACKAGE_VARIANT: ${{ matrix.package_variant }}
+          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          export TERMUX_PACKAGE_VARIANT="$PACKAGE_VARIANT"
+
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            -I "$RUNNER_TEMP/release-signing.gradle" \
+            assembleRelease
+
+      - name: Verify APK and generate checksum
+        shell: bash
+        env:
+          PACKAGE_VARIANT: ${{ matrix.package_variant }}
+        run: |
+          set -euo pipefail
+
+          APK_DIR="app/build/outputs/apk/release"
+
+          APK_NAME="termux-app_${TAG_NAME}+${PACKAGE_VARIANT}-signed_universal.apk"
+
+          APK_PATH="$APK_DIR/$APK_NAME"
+
+          if [[ ! -f "$APK_PATH" ]]; then
+            echo "::error::APK not found: $APK_PATH"
+            find "$APK_DIR" -type f
+            exit 1
+          fi
+
+          # Verify APK signature
+          APKSIGNER="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)/apksigner"
+
+          "$APKSIGNER" verify --verbose "$APK_PATH"
+
+          mkdir -p dist
+
+          cp "$APK_PATH" "dist/$APK_NAME"
+
+          cd dist
+          sha256sum "$APK_NAME" > "checksums-${PACKAGE_VARIANT}.txt"
+
+          cat "checksums-${PACKAGE_VARIANT}.txt"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: termux-${{ matrix.package_variant }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove signing materials
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "$RUNNER_TEMP/termux-signing"
+          rm -f "$RUNNER_TEMP/release-signing.gradle"
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate release notes
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag_name }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            TAG_NAME="$GITHUB_REF_NAME"
+          else
+            TAG_NAME="$INPUT_TAG"
+          fi
+
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_ENV"
+
+          cat > dist/BUILD-INFO.txt <<EOF
+          Termux Custom Signed Release
+
+          Version: $TAG_NAME
+
+          Package variants:
+          - apt-android-7
+          - apt-android-5
+
+          Signed with a custom release keystore.
+          EOF
+
+          ls -lh dist
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: Termux ${{ env.TAG_NAME }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.apk
+            dist/*.txt
