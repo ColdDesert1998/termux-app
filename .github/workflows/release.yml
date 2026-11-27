@@ -37,6 +37,13 @@ jobs:
         run: |
           echo "${{ secrets.RELEASE_KEYSTORE_BASE64 }}" | base64 -d > release.keystore
         # 需要提前在 Settings → Secrets 中配置 RELEASE_KEYSTORE_BASE64
+      # --- 新增以下步骤 ---
+      - name: Accept all Android SDK licenses
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses
+        # 路径可能因 Runner 环境而异，如果失败，可尝试以下备选路径：
+        # run: yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses
+        # 或更早期的路径：
+        # run: yes | $ANDROID_HOME/tools/bin/sdkmanager --licenses
 
       - name: Build release APKs
         env:
