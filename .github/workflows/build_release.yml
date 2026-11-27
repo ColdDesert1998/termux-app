@@ -195,8 +195,7 @@ jobs:
           ./gradlew \
             --no-daemon \
             --stacktrace \
-            assemble
-            Release
+            assembleRelease
 
       # 8. Verify APK signature and generate checksum
       - name: Verify APK and generate checksum
