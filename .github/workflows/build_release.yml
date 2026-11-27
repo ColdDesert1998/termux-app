@@ -33,22 +33,26 @@ jobs:
           - apt-android-5
 
     steps:
+      # 1. Checkout source
       - name: Checkout source
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
+      # 2. Setup Java
       - name: Setup JDK 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
+      # 3. Setup Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
-             packages: platform-tools
+          packages: platform-tools
 
+      # 4. Prepare release information
       - name: Prepare release information
         shell: bash
         env:
@@ -75,9 +79,9 @@ jobs:
           echo "PACKAGE_VARIANT=$PACKAGE_VARIANT" >> "$GITHUB_ENV"
 
           echo "TERMUX_APP_VERSION_NAME=$VERSION" >> "$GITHUB_ENV"
-
           echo "TERMUX_APK_VERSION_TAG=${TAG_NAME}+${PACKAGE_VARIANT}-signed" >> "$GITHUB_ENV"
 
+      # 5. Decode release keystore
       - name: Setup release signing
         shell: bash
         env:
@@ -108,47 +112,73 @@ jobs:
             -storepass "$KEYSTORE_PASSWORD" \
             -alias "$KEY_ALIAS" >/dev/null
 
-          echo "TERMUX_KEYSTORE_FILE=$RUNNER_TEMP/termux-signing/release.jks" >> "$GITHUB_ENV"
+          echo "TERMUX_RELEASE_KEYSTORE=$RUNNER_TEMP/termux-signing/release.jks" >> "$GITHUB_ENV"
 
-      - name: Create signing Gradle init script
+      # 6. Configure Gradle release signing
+      - name: Configure Release signing
         shell: bash
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
-          cat > "$RUNNER_TEMP/release-signing.gradle" <<'GRADLE'
-          gradle.projectsEvaluated {
-              def app = gradle.rootProject.findProject(":app")
+          set -euo pipefail
 
-              if (app == null) {
-                  throw new GradleException("Cannot find :app project")
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path("app/build.gradle")
+
+          if not path.exists():
+              raise SystemExit("app/build.gradle not found")
+
+          content = path.read_text()
+
+          old_signing = """    signingConfigs {
+              debug {"""
+
+          new_signing = """    signingConfigs {
+              release {
+                  storeFile file(System.getenv("TERMUX_RELEASE_KEYSTORE"))
+                  storePassword System.getenv("RELEASE_KEYSTORE_PASSWORD")
+                  keyAlias System.getenv("RELEASE_KEY_ALIAS")
+                  keyPassword System.getenv("RELEASE_KEY_PASSWORD")
               }
 
-              def android = app.extensions.findByName("android")
+              debug {"""
 
-              if (android == null) {
-                  throw new GradleException("Android extension not found")
-              }
+          if old_signing not in content:
+              raise SystemExit(
+                  "Cannot find signingConfigs block. "
+                  "Check app/build.gradle structure."
+              )
 
-              def signing = android.signingConfigs.create("ciRelease")
+          content = content.replace(old_signing, new_signing, 1)
 
-              signing.storeFile = new File(System.getenv("TERMUX_KEYSTORE_FILE"))
-              signing.storePassword = System.getenv("KEYSTORE_PASSWORD")
-              signing.keyAlias = System.getenv("KEY_ALIAS")
-              signing.keyPassword = System.getenv("KEY_PASSWORD")
+          old_release = """        release {
+              minifyEnabled true"""
 
-              android.buildTypes.getByName("release").signingConfig = signing
-          }
-          GRADLE
+          new_release = """        release {
+              signingConfig signingConfigs.release
+              minifyEnabled true"""
 
+          if old_release not in content:
+              raise SystemExit(
+                  "Cannot find release buildType block. "
+                  "Check app/build.gradle structure."
+              )
+
+          content = content.replace(old_release, new_release, 1)
+
+          path.write_text(content)
+
+          print("Release signing configuration applied successfully")
+          PY
+
+      # 7. Build signed APK
       - name: Build signed Release APK
         shell: bash
         env:
           PACKAGE_VARIANT: ${{ matrix.package_variant }}
-          KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
 
@@ -157,9 +187,9 @@ jobs:
           ./gradlew \
             --no-daemon \
             --stacktrace \
-            -I "$RUNNER_TEMP/release-signing.gradle" \
             assembleRelease
 
+      # 8. Verify APK and generate checksum
       - name: Verify APK and generate checksum
         shell: bash
         env:
@@ -175,12 +205,13 @@ jobs:
 
           if [[ ! -f "$APK_PATH" ]]; then
             echo "::error::APK not found: $APK_PATH"
-            find "$APK_DIR" -type f
+            find app/build/outputs/apk -type f
             exit 1
           fi
 
-          # Verify APK signature
-          APKSIGNER="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)/apksigner"
+          BUILD_TOOLS_VERSION=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)
+
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner"
 
           "$APKSIGNER" verify --verbose "$APK_PATH"
 
@@ -189,10 +220,12 @@ jobs:
           cp "$APK_PATH" "dist/$APK_NAME"
 
           cd dist
+
           sha256sum "$APK_NAME" > "checksums-${PACKAGE_VARIANT}.txt"
 
           cat "checksums-${PACKAGE_VARIANT}.txt"
 
+      # 9. Upload build artifacts
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -201,13 +234,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # 10. Cleanup signing materials
       - name: Remove signing materials
         if: always()
         shell: bash
         run: |
           rm -rf "$RUNNER_TEMP/termux-signing"
-          rm -f "$RUNNER_TEMP/release-signing.gradle"
 
+  # 11. Publish release
   release:
     name: Publish GitHub Release
     needs: build
@@ -220,11 +254,13 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Generate release notes
+      - name: Generate release information
         shell: bash
         env:
           INPUT_TAG: ${{ inputs.tag_name }}
         run: |
+          set -euo pipefail
+
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             TAG_NAME="$GITHUB_REF_NAME"
           else
@@ -247,7 +283,7 @@ jobs:
 
           ls -lh dist
 
-      - name: Publish Release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG_NAME }}
